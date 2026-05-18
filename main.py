@@ -324,7 +324,7 @@ def reload_env_globals():
     VIDEO_MODELS = model_list("VIDEO_MODELS", "veo3-fast", [
         "veo2", "veo2-fast", "veo2-pro",
         "veo3", "veo3-fast", "veo3-pro",
-        "veo3.1", "veo3.1-fast", "veo3.1-pro",
+        "veo3.1", "veo3.1-fast", "veo3.1-quality", "veo3.1-lite",
         "sora-2", "sora-2-pro",
         "wan2.6-t2v", "wan2.6-i2v",
         "wan2.5-t2v-preview", "wan2.5-i2v-preview",
@@ -345,7 +345,7 @@ VIDEO_MODELS = model_list("VIDEO_MODELS", "veo3-fast", [
     # —— Veo 系列 ——
     "veo2", "veo2-fast", "veo2-pro",
     "veo3", "veo3-fast", "veo3-pro",
-    "veo3.1", "veo3.1-fast", "veo3.1-pro",
+    "veo3.1", "veo3.1-fast", "veo3.1-quality", "veo3.1-lite",
     # —— Sora ——
     "sora-2", "sora-2-pro",
     # —— 阿里 通义万相 ——
@@ -1348,6 +1348,52 @@ def valid_apimart_video_image_input(value: str) -> bool:
     value = value.strip()
     return value.startswith("http://") or value.startswith("https://") or value.startswith("asset://")
 
+def is_apimart_veo31_model(model: str) -> bool:
+    return str(model or "").strip().lower().startswith("veo3.1")
+
+def apimart_veo31_model(model: str) -> str:
+    value = str(model or "").strip().lower()
+    aliases = {
+        "veo3.1": "veo3.1-fast",
+        "veo3.1-pro": "veo3.1-quality",
+        "veo3.1-preview": "veo3.1-fast",
+    }
+    value = aliases.get(value, value or "veo3.1-fast")
+    allowed = {"veo3.1-fast", "veo3.1-quality", "veo3.1-lite"}
+    return value if value in allowed else "veo3.1-fast"
+
+def apimart_veo31_aspect(aspect: str) -> str:
+    value = str(aspect or "16:9").strip()
+    return value if value in {"16:9", "9:16"} else "16:9"
+
+def apimart_veo31_resolution(resolution: str) -> str:
+    value = str(resolution or "").strip().lower()
+    aliases = {"": "720p", "auto": "720p", "480p": "720p", "780p": "720p", "1080": "1080p", "4k": "4k"}
+    value = aliases.get(value, value)
+    return value if value in {"720p", "1080p", "4k"} else "720p"
+
+def apimart_upload_file_payload(path: str):
+    """Return (filename, bytes, content_type), keeping APIMart VEO images under the documented 10MB limit."""
+    max_bytes = 9_500_000
+    size = os.path.getsize(path)
+    if size <= max_bytes:
+        with open(path, "rb") as fh:
+            return os.path.basename(path), fh.read(), content_type_for_path(path)
+    with Image.open(path) as img:
+        img = img.convert("RGBA")
+        bg = Image.new("RGB", img.size, (255, 255, 255))
+        bg.paste(img, mask=img.split()[-1])
+        quality = 92
+        while quality >= 62:
+            buf = BytesIO()
+            bg.save(buf, format="JPEG", quality=quality, optimize=True)
+            data = buf.getvalue()
+            if len(data) <= max_bytes:
+                name = os.path.splitext(os.path.basename(path))[0] + ".jpg"
+                return name, data, "image/jpeg"
+            quality -= 8
+    raise ValueError("图片超过 10MB，且压缩后仍无法满足 VEO3.1 图片限制")
+
 def invalid_video_image_preview(value: str) -> str:
     text = str(value or "")
     if text.startswith("data:"):
@@ -1396,12 +1442,11 @@ async def upload_image_for_apimart(client, provider, ref_url: str) -> str:
     if not path:
         return ""  # 无法解析成本地文件时，避免把无效本地路径传给上游
     try:
-        ct = content_type_for_path(path)
         base_url = video_api_root(provider)
         upload_url = f"{base_url}/v1/uploads/images"
-        with open(path, "rb") as fh:
-            files = {"file": (os.path.basename(path), fh, ct)}
-            resp = await client.post(upload_url, headers=api_headers(json_body=False, provider=provider), files=files, timeout=60)
+        filename, content, ct = apimart_upload_file_payload(path)
+        files = {"file": (filename, content, ct)}
+        resp = await client.post(upload_url, headers=api_headers(json_body=False, provider=provider), files=files, timeout=60)
         if resp.status_code in (200, 201):
             rj = resp.json()
             url = extract_apimart_asset_url(rj)
@@ -2233,6 +2278,8 @@ async def canvas_video(payload: CanvasVideoRequest):
         raise HTTPException(status_code=400, detail=f"未配置 {provider.get('name') or provider['id']} 的 API Key，请在 API 设置中填写。")
     is_apimart = is_apimart_provider(provider)
     submit_url = f"{base_url}/videos/generations" if is_apimart and base_url.endswith("/v1") else f"{base_url}/v1/videos/generations" if is_apimart else f"{base_url}/v2/videos/generations"
+    requested_model = selected_model(payload.model, "veo3-fast")
+    is_veo31 = is_apimart and is_apimart_veo31_model(requested_model)
     try:
         async with httpx.AsyncClient(timeout=VIDEO_POLL_TIMEOUT) as client:
             # --- 构造图片载荷 ---
@@ -2240,11 +2287,15 @@ async def canvas_video(payload: CanvasVideoRequest):
                 # APIMart 只接受 http/https 或 asset:// URL，先上传本地图片取回网络 URL
                 image_with_roles = []
                 invalid_images = []
-                for ref in payload.images[:9]:
+                apimart_model = apimart_veo31_model(requested_model) if is_veo31 else ""
+                if apimart_model == "veo3.1-lite" and payload.images:
+                    raise HTTPException(status_code=400, detail="veo3.1-lite 不支持图片输入，请改用 veo3.1-fast 或 veo3.1-quality。")
+                image_limit = 0 if apimart_model == "veo3.1-lite" else (3 if is_veo31 else 9)
+                for ref in payload.images[:image_limit]:
                     if not ref.url:
                         continue
                     role = str(ref.role or "").strip()
-                    if role in {"first_frame", "last_frame", "reference_image"}:
+                    if not is_veo31 and role in {"first_frame", "last_frame", "reference_image"}:
                         up_url = await upload_image_for_apimart(client, provider, ref.url)
                         if valid_apimart_video_image_input(up_url):
                             image_with_roles.append({"url": up_url, "role": role})
@@ -2252,7 +2303,7 @@ async def canvas_video(payload: CanvasVideoRequest):
                             invalid_images.append(ref.url)
                 image_payload = []
                 if not image_with_roles:
-                    for ref in payload.images[:9]:
+                    for ref in payload.images[:image_limit]:
                         if not ref.url:
                             continue
                         up_url = await upload_image_for_apimart(client, provider, ref.url)
@@ -2262,27 +2313,48 @@ async def canvas_video(payload: CanvasVideoRequest):
                             invalid_images.append(ref.url)
                 if payload.images and not image_with_roles and not image_payload:
                     sample = invalid_video_image_preview(invalid_images[0] if invalid_images else "")
-                    raise HTTPException(status_code=400, detail=f"输入图片无法转换为视频接口支持的格式：{sample}")
+                    raise HTTPException(status_code=400, detail=f"输入图片无法转换为视频接口支持的格式：{sample}。请确认本地文件存在，且图片不超过 10MB；VEO3.1 需要先上传为 APIMart 可访问的 http/https 或 asset:// 图片。")
                 # --- APIMart 请求体 ---
-                body = {
-                    "prompt": payload.prompt,
-                    "model": selected_model(payload.model, "doubao-seedance-2.0"),
-                    "duration": payload.duration,
-                    "size": apimart_video_size(payload.aspect_ratio or payload.size),
-                    "resolution": payload.resolution or "480p",
-                }
-                if image_with_roles:
-                    body["image_with_roles"] = image_with_roles
-                elif image_payload:
-                    body["image_urls"] = image_payload[:9]
-                if payload.videos:
-                    body["video_urls"] = [v for v in payload.videos if v][:3]
-                if payload.seed is not None:
-                    body["seed"] = payload.seed
-                if payload.return_last_frame:
-                    body["return_last_frame"] = True
-                if payload.generate_audio:
-                    body["generate_audio"] = True
+                if is_veo31:
+                    model = apimart_model
+                    body = {
+                        "prompt": payload.prompt,
+                        "model": model,
+                        "duration": 8,
+                        "aspect_ratio": apimart_veo31_aspect(payload.aspect_ratio),
+                        "resolution": apimart_veo31_resolution(payload.resolution),
+                    }
+                    if image_payload and model != "veo3.1-lite":
+                        video_images = image_payload[:3]
+                        if model == "veo3.1-quality" and len(video_images) > 2:
+                            video_images = video_images[:2]
+                        body["image_urls"] = video_images
+                        if len(video_images) == 2:
+                            body["generation_type"] = "frame"
+                        elif len(video_images) >= 3 and model != "veo3.1-quality":
+                            body["generation_type"] = "reference"
+                    if model != "veo3.1-lite":
+                        body["official_fallback"] = False
+                else:
+                    body = {
+                        "prompt": payload.prompt,
+                        "model": selected_model(payload.model, "doubao-seedance-2.0"),
+                        "duration": payload.duration,
+                        "size": apimart_video_size(payload.aspect_ratio or payload.size),
+                        "resolution": payload.resolution or "480p",
+                    }
+                    if image_with_roles:
+                        body["image_with_roles"] = image_with_roles
+                    elif image_payload:
+                        body["image_urls"] = image_payload[:9]
+                    if payload.videos:
+                        body["video_urls"] = [v for v in payload.videos if v][:3]
+                    if payload.seed is not None:
+                        body["seed"] = payload.seed
+                    if payload.return_last_frame:
+                        body["return_last_frame"] = True
+                    if payload.generate_audio:
+                        body["generate_audio"] = True
             else:
                 # 非 APIMart：data URL 方式（OpenAI / ComflyAI 接口）
                 image_payload = []
